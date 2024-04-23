@@ -346,7 +346,7 @@ public:
 //******************************************************************************************************//
 // <同步队列>——————>工作窃取线程池
 //	
-// 工作窃取线程池的同步队列使用“vector为引， list为体”实现一个线程对应一个任务队列的同步队列。 
+// 工作窃取线程池的同步队列使用 “vector为引，list为体” 实现一个线程对应一个任务队列的同步队列。 
 //******************************************************************************************************//
 template<class Task>
 class SyncQueueToWork {
@@ -462,7 +462,7 @@ public:
 		return 0;
 	}
 
-	
+	//
 	int Take(std::list<Task>& tasklist, const int index) {
 		std::unique_lock<std::mutex> locker(m_mutex);
 		bool waitret = m_notEmpty.wait_for(locker, std::chrono::seconds(m_waitTime), [this, index]()->bool {return m_needStop || !IsEmpty(index); });
@@ -516,7 +516,7 @@ public:
 		return TotalTaskCount();
 	}
 
-
+	//
 	size_t Count() const {
 		return TotalTaskCount();
 	}
@@ -526,10 +526,6 @@ public:
 		std::unique_lock<std::mutex> locker(m_mutex);
 		return m_queue[index].size();
 	}
-
-
-
-
 
 	//析构
 	~SyncQueueToWork() {
@@ -542,9 +538,158 @@ public:
 //******************************************************************************************************//
 // <同步队列>——————>计划线程池
 //	
-// 计划线程池的同步队列使用 
+// 计划线程池的同步队列使用key-val形式的map存储 <<延迟时间, 任务>>，以待取任务时可以获得延迟的时间，以实现在一
+// 定时间点或时间间隔运行某一任务。
 //******************************************************************************************************//
 template<class Task>
 class SyncQueueToScheduled {
+private:
+	std::map<int, Task> m_queue;	//key->延迟	val->任务
+	std::mutex m_mutex;
+	std::condition_variable m_notEmpty;	//对应消费者
+	std::condition_variable m_notFull;	//对应生产者
+	std::condition_variable m_waitStop;	//针对等待停止的条件变量
+	size_t m_maxSize;	//任务上限
+	size_t m_waitTime = 10;		//等待时间10ms
+	bool m_Stop;		//false->运行,true->停止	
+
+private:
+	//添加任务
+	template<typename F>
+	int Add(int val, F&& f) {
+		//F&& f	引用型别未定义
+		std::unique_lock<std::mutex> locker(m_mutex);
+		while (!m_Stop && IsFull()) {
+			if (std::cv_status::timeout == m_notFull.wait_for(locker, std::chrono::milliseconds(m_waitTime))) {
+				//我们要防止添加任务多次失败的情况
+				return -1;
+			}
+		}
+		if (m_Stop) {
+			//停止
+			return -2;
+		}
+		//m_queue.push_back(std::forward<F>(f));
+		m_queue.emplace(val, std::forward<F>(f));
+		m_notEmpty.notify_all();	//<3>从条件变量的等待队列移入互斥锁的等待队列 <4>获锁
+		return 0;
+	}
+
+	//判满
+	bool IsFull() const {
+		return m_queue.size() >= m_maxSize;
+	}
+
+	//判空
+	bool IsEmpty() const {
+		return m_queue.empty();
+	}
+
+public:
+	SyncQueueToScheduled(size_t maxsize) {
+		m_maxSize = maxsize;
+		m_Stop = false;
+	}
+
+	//强制停止——同步队列
+	void Stop() {
+		{
+			std::unique_lock<std::mutex> locker(m_mutex);
+			m_Stop = true;
+		}
+		//唤醒所有等待队列中的线程（通过m_Stop在运行中停止）
+		m_notEmpty.notify_all();
+		m_notFull.notify_all();
+	}
+
+	//等待停止——同步队列
+	void WaitStop() {
+		std::unique_lock<std::mutex> locker(m_mutex);
+		while (!IsEmpty()) {
+			//m_waitStop.wait(locker);//没有任何东西唤醒它
+			m_waitStop.wait_for(locker, std::chrono::milliseconds(10));		//延迟后面的停止操作。
+		}
+		m_Stop = true;
+		m_notEmpty.notify_all();
+		m_notFull.notify_all();
+	}
+
+	//生产者
+	int Put(int val, const Task& task) {
+		return Add(val, task);
+	}
+
+	//
+	int Put(int val, Task&& task) {
+		return Add(val, std::forward<Task>(task));
+	}
+
+	//消费者
+	int Take(Task& task) {
+		//std::unique_lock<std::mutex> locker(m_mutex);
+		//while (!m_Stop && IsEmpty()) {
+		//	//m_notEmpty.wait(locker);
+		//	if (std::cv_status::timeout == m_notEmpty.wait_for(locker, std::chrono::seconds(1))) {
+		//		//因为超时因而
+		//		return -1
+		//	}
+		//}
+		//if (m_Stop) {
+		//	//是否停止
+		//	return -2
+		//}
+		////钓鱼
+		//task = m_queue.front();
+		//m_queue.pop_front();
+		//m_notFull.notify_all();
+		//return 0;
+	}
+
+	//
+	int Take(std::list<Task>& tasklist) {
+		//std::unique_lock<std::mutex> locker(m_mutex);
+		//while (!m_Stop && IsEmpty()) {
+		//	//m_notEmpty.wait(locker);
+		//	if (std::cv_status::timeout == m_notEmpty.wait_for(locker, std::chrono::seconds(1))) {
+		//		//因为超时因而
+		//		return -1
+		//	}
+		//}
+		//if (m_Stop) {
+		//	return -2
+		//}
+		////钓鱼
+		//tasklist = std::move(m_queue);
+		//m_notFull.notify_all();
+		//return 0;
+	}
+
+	//判断为空
+	bool Empty() const {
+		std::unique_lock<std::mutex> locker(m_mutex);
+		return m_queue.empty();
+	}
+
+	//判断为满
+	bool Full() const {
+		std::unique_lock<std::mutex> locker(m_mutex);
+		return m_queue.size() >= m_maxSize;
+	}
+
+	//获取大小
+	size_t Size() const {
+		std::unique_lock<std::mutex> locker(m_mutex);
+		return m_queue.size();
+	}
+
+	//
+	size_t Count() const {
+		return m_queue.size();
+	}
+
+	//析构
+	~SyncQueueToScheduled() {
+		//Stop();
+	}
 
 };
